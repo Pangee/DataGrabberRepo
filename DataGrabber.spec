@@ -52,4 +52,13 @@ app = BUNDLE(
     name='DataGrabber.app',
     icon='DataGrabber.icns',
     bundle_identifier='com.datagrabber.DataGrabber',
+    info_plist={
+        'NSHighResolutionCapable': True,
+        'NSSupportsAutomaticGraphicsSwitching': True,
+        'NSSupportsSuddenTermination': False,
+        'NSSupportsAutomaticTermination': False,
+        'LSMinimumSystemVersion': '15.0',
+        'LSMultipleInstancesProhibited': True,
+        'CFBundleSupportedPlatforms': ['MacOSX'],
+    },
 )

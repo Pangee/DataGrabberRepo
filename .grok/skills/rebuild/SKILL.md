@@ -35,6 +35,24 @@ fi
 source venv/bin/activate
 pip install certifi
 pyinstaller --noconfirm --windowed --name "DataGrabber" --osx-bundle-identifier "com.datagrabber.DataGrabber" --icon "DataGrabber.icns" --clean --collect-data certifi DataGrabber.py
+python - << 'PY'
+import plistlib
+from pathlib import Path
+
+p = Path("dist/DataGrabber.app/Contents/Info.plist")
+with p.open("rb") as fh:
+    info = plistlib.load(fh)
+info["NSHighResolutionCapable"] = True
+info["NSSupportsAutomaticGraphicsSwitching"] = True
+info["NSSupportsSuddenTermination"] = False
+info["NSSupportsAutomaticTermination"] = False
+info["LSMinimumSystemVersion"] = "15.0"
+info["LSMultipleInstancesProhibited"] = True
+info["CFBundleSupportedPlatforms"] = ["MacOSX"]
+with p.open("wb") as fh:
+    plistlib.dump(info, fh)
+print("INFO_PLIST_OK")
+PY
 xattr -cr "$APP_SRC"
 
 # Copy finished current-use county files into Application Support BEFORE the

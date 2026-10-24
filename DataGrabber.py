@@ -80,15 +80,19 @@ window says so and that county cannot be searched.
 No other code changes are required for ordinary counties.
 """
 
+import os
+import sys
+
+# Homebrew Tk 9 prints deprecation noise on newer macOS (Tahoe included).
+os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
+
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import webbrowser
 import time
 import re
 import ctypes
-import os
 import shutil
-import sys
 import threading
 import json
 import sqlite3
@@ -687,9 +691,25 @@ def _set_thread_qos(background):
         libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
         # QOS_CLASS_UTILITY is below QOS_CLASS_USER_INITIATED.
         qos = 0x11 if background else 0x19
+        libsystem.pthread_set_qos_class_self_np.restype = ctypes.c_int
+        libsystem.pthread_set_qos_class_self_np.argtypes = [ctypes.c_uint, ctypes.c_int]
         libsystem.pthread_set_qos_class_self_np(ctypes.c_uint(qos), ctypes.c_int(0))
     except Exception:
         return
+
+
+def _configure_macos_app(root):
+    """Keep Aqua/Tk usable on Sequoia, Tahoe, and Apple Silicon Tk 8/9."""
+    if sys.platform != "darwin":
+        return
+    try:
+        root.createcommand("tk::mac::Quit", root.quit)
+    except tk.TclError:
+        pass
+    try:
+        root.tk.call("package", "require", "Tk")
+    except tk.TclError:
+        pass
 
 
 def _user_work_enter():
@@ -5340,6 +5360,7 @@ def build_gui():
     global position_loading, auto_update_var, clean_view_var, map_link_type_var, map_link_dropdown
 
     root = tk.Tk()
+    _configure_macos_app(root)
     root.title("County Property Lookup")
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"{int(sw * 0.5)}x{sh - 100}+0+0")
