@@ -4,7 +4,7 @@ County property lookup for macOS.
 
 ## Download
 
-Get **DataGrabber 1.1** from [Releases](https://github.com/Pangee/DataGrabberRepo/releases/tag/v1.1).
+Get **DataGrabber 1.0** from [Releases](https://github.com/Pangee/DataGrabberRepo/releases/tag/v1.0).
 
 Requires macOS 15 or later on Apple Silicon.
 

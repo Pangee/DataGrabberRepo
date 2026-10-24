@@ -860,12 +860,7 @@ def build_where_clause(name_input, address_input, cfg):
         owner_fields = cfg.get("owner_field", "NAME")
         if not isinstance(owner_fields, list):
             owner_fields = [owner_fields]
-        seen = set()
-        for word in re.split(r"\s+", name):
-            word = word.strip(",.")
-            if not word or len(word) == 1 or word in seen:
-                continue
-            seen.add(word)
+        for word in _name_words(name_input):
             safe = word.replace("'", "''")
             conditions.append(
                 "(" + " OR ".join(f"UPPER({f}) LIKE '%{safe}%'" for f in owner_fields) + ")"
@@ -2674,12 +2669,7 @@ def record_matches(attrs, name_input, address_input, cfg):
         owner_fields = cfg.get("owner_field", "NAME")
         if not isinstance(owner_fields, list):
             owner_fields = [owner_fields]
-        seen = set()
-        for word in re.split(r"\s+", name):
-            word = word.strip(",.")
-            if not word or len(word) == 1 or word in seen:
-                continue
-            seen.add(word)
+        for word in _name_words(name_input):
             if not any(word in _field_text(attrs, field).upper() for field in owner_fields):
                 return False
     if address and cfg.get("is_two_step"):
@@ -2714,16 +2704,18 @@ _STREET_TYPES = {
 
 
 def _name_words(name_input):
+    """Skip one-letter initials when a longer name word is also present."""
     name = " ".join(name_input.strip().upper().split()) if name_input else ""
     words = []
     seen = set()
     for word in re.split(r"\s+", name):
         word = word.strip(",.")
-        if not word or len(word) == 1 or word in seen:
+        if not word or word in seen:
             continue
         seen.add(word)
         words.append(word)
-    return words
+    long_words = [word for word in words if len(word) > 1]
+    return long_words if long_words else words
 
 
 def _prefix_upper_bound(prefix):
