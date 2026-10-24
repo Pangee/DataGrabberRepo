@@ -13,6 +13,14 @@ source venv/bin/activate && pip install certifi && pyinstaller --noconfirm --win
 Or just tell grok "rebuild" and it will throw an updated build into your desktop replacing any old builds that already exist there.
 Before the old Desktop app is moved to the Trash, its finished county databases are copied into ~/Library/Application Support/DataGrabber and checked so they stay finished. The running app keeps its databases there, so updates work wherever the .app is stored.
 
+To commit a github repo update from this device paste the following into Visual Studio's terminal:
+git add DataGrabber.py
+git commit -m "Simple update"
+git push
+
+To upload data to Cloudflare, paste this in your Mac terminal:
+rclone copy "$HOME/Library/Application Support/DataGrabber/taxlots_current" r2:datagrabberdata/taxlots_current --progress --ignore-existing
+
 
 
 ────────────────────────────────────────────────────────────────────────────
@@ -1270,7 +1278,7 @@ def _county_filename_stem(name):
 
 def _county_dest_path(directory, filename):
     """taxlots_current/oregon/oregon-jackson.sqlite from a county filename."""
-    name = Path(filename).name
+    name = Path(name).name
     stem = _county_filename_stem(name)
     if stem.endswith(".sqlite"):
         key = stem[: -len(".sqlite")]
