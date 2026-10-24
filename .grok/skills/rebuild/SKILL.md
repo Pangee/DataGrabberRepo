@@ -37,6 +37,7 @@ pip install certifi
 pyinstaller --noconfirm --windowed --name "DataGrabber" --osx-bundle-identifier "com.datagrabber.DataGrabber" --icon "DataGrabber.icns" --clean --collect-data certifi DataGrabber.py
 python - << 'PY'
 import plistlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 p = Path("dist/DataGrabber.app/Contents/Info.plist")
@@ -49,9 +50,13 @@ info["NSSupportsAutomaticTermination"] = False
 info["LSMinimumSystemVersion"] = "15.0"
 info["LSMultipleInstancesProhibited"] = True
 info["CFBundleSupportedPlatforms"] = ["MacOSX"]
+# Unique per rebuild so a new Desktop .app is a first launch even when
+# Application Support already has county files from earlier builds.
+info["CFBundleVersion"] = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 with p.open("wb") as fh:
     plistlib.dump(info, fh)
 print("INFO_PLIST_OK")
+print("CFBundleVersion", info["CFBundleVersion"])
 PY
 xattr -cr "$APP_SRC"
 

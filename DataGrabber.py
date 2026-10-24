@@ -82,6 +82,9 @@ No other code changes are required for ordinary counties.
 
 import os
 import sys
+import hashlib
+import hmac
+import shlex
 
 # Homebrew Tk 9 prints deprecation noise on newer macOS (Tahoe included).
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
@@ -100,9 +103,9 @@ import ssl
 import subprocess
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, quote_plus, urlencode
+from urllib.parse import quote, quote_plus, urlencode, urlparse
 
 # ── SSL certificates for the frozen .app ──────────────────────────────────
 # PyInstaller bundles do not always find macOS system CA certs, so every
@@ -118,6 +121,15 @@ def _make_ssl_context():
 
 
 _SSL_CONTEXT = _make_ssl_context()
+
+# Public R2 prefix, e.g. https://pub-….r2.dev/taxlots_current
+# Leave empty to use signed S3 (rclone.conf or Application Support r2.json).
+CLOUD_PACK_BASE_URL = ""
+CLOUD_PACK_S3_ENDPOINT = (
+    "https://e4646317e20ffeac92a6e8edd4c9bd11.r2.cloudflarestorage.com"
+)
+CLOUD_PACK_S3_BUCKET = "datagrabberdata"
+CLOUD_PACK_S3_PREFIX = "taxlots_current"
 
 
 def _urlopen(req, timeout=20):
@@ -681,6 +693,7 @@ _auto_update_on = threading.Event()  # checkbox; off until a saved "on" is read
 _refresh_active = False  # the one refresh thread is inside its county list
 _refreshing_county = None  # county the gold line is grabbing an update for
 _startup_ready = False  # county folders have been cleaned for this launch
+_ui_locked = False  # first-launch init: no searches or control changes
 
 
 def _set_thread_qos(background):
@@ -1298,7 +1311,7 @@ def _county_filename_stem(name):
 
 def _county_dest_path(directory, filename):
     """taxlots_current/oregon/oregon-jackson.sqlite from a county filename."""
-    name = Path(name).name
+    name = Path(filename).name
     stem = _county_filename_stem(name)
     if stem.endswith(".sqlite"):
         key = stem[: -len(".sqlite")]
@@ -1741,6 +1754,225 @@ def current_file_is_ready(state, county):
         return False
     header = peek_county_header(path)
     return bool(header and header[1])
+
+
+def _credentials_from_r2_json(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    access = data.get("access_key_id") or data.get("accessKeyId")
+    secret = data.get("secret_access_key") or data.get("secretAccessKey")
+    if access and secret:
+        return str(access), str(secret)
+    return None
+
+
+def _credentials_from_rclone_conf(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    section = None
+    access = None
+    secret = None
+    found = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            if section == "r2" and access and secret:
+                found = (access, secret)
+            section = line[1:-1].strip()
+            access = None
+            secret = None
+            continue
+        if section != "r2" or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key == "access_key_id":
+            access = value
+        elif key == "secret_access_key":
+            secret = value
+    if section == "r2" and access and secret:
+        found = (access, secret)
+    return found
+
+
+def _r2_credentials():
+    """Keys from Application Support r2.json, then rclone.conf [r2]. Never from source."""
+    for path in (
+        _app_support_dir() / "r2.json",
+        Path.home() / ".config" / "rclone" / "rclone.conf",
+        Path.home() / ".rclone.conf",
+    ):
+        if path.suffix == ".json":
+            creds = _credentials_from_r2_json(path)
+        else:
+            creds = _credentials_from_rclone_conf(path)
+        if creds:
+            return creds
+    return None
+
+
+def _hmac_sha256(key, msg):
+    if isinstance(msg, str):
+        msg = msg.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).digest()
+
+
+def _signed_s3_request(url, access_key, secret_key, region="auto"):
+    """AWS SigV4 GET for Cloudflare R2. Payload is unsigned."""
+    parsed = urlparse(url)
+    host = parsed.netloc
+    canonical_uri = quote(parsed.path or "/", safe="/-_.~")
+    canonical_query = parsed.query or ""
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    payload_hash = "UNSIGNED-PAYLOAD"
+    canonical_headers = (
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_request = "\n".join((
+        "GET",
+        canonical_uri,
+        canonical_query,
+        canonical_headers,
+        signed_headers,
+        payload_hash,
+    ))
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join((
+        algorithm,
+        amz_date,
+        credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ))
+    signing_key = _hmac_sha256(
+        _hmac_sha256(
+            _hmac_sha256(
+                _hmac_sha256(("AWS4" + secret_key).encode("utf-8"), date_stamp),
+                region,
+            ),
+            "s3",
+        ),
+        "aws4_request",
+    )
+    signature = hmac.new(
+        signing_key, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    authorization = (
+        f"{algorithm} Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Host", host)
+    req.add_header("x-amz-date", amz_date)
+    req.add_header("x-amz-content-sha256", payload_hash)
+    req.add_header("Authorization", authorization)
+    req.add_header("Accept-Encoding", "identity")
+    return req
+
+
+def _stream_http_to_path(req, dest):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with _urlopen(req, timeout=300) as response:
+            expected = response.headers.get("Content-Length")
+            expected_n = int(expected) if expected and str(expected).isdigit() else None
+            with open(dest, "wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+        if expected_n is not None and dest.stat().st_size != expected_n:
+            raise OSError("incomplete cloud download")
+    except Exception:
+        try:
+            if dest.exists():
+                dest.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def download_cloud_county_file(state, county):
+    """Copy one missing county file from R2. Never replace a file already on disk."""
+    dest = county_file_path(current_data_dir(), state, county)
+    if dest.exists():
+        return False
+    tmp = dest.with_name(dest.name + ".replacing")
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except OSError:
+        pass
+    folder = _name_token(state)
+    filename = county_file_name(state, county)
+    attempts = []
+    base = (CLOUD_PACK_BASE_URL or "").strip().rstrip("/")
+    if base:
+        attempts.append((f"{base}/{folder}/{filename}", None))
+    creds = _r2_credentials()
+    if creds:
+        s3_url = (
+            f"{CLOUD_PACK_S3_ENDPOINT.rstrip('/')}/"
+            f"{CLOUD_PACK_S3_BUCKET}/{CLOUD_PACK_S3_PREFIX}/"
+            f"{folder}/{filename}"
+        )
+        attempts.append((s3_url, creds))
+    for url, signed in attempts:
+        try:
+            if signed:
+                req = _signed_s3_request(url, signed[0], signed[1])
+            else:
+                req = urllib.request.Request(url, method="GET")
+                req.add_header("Accept-Encoding", "identity")
+            _stream_http_to_path(req, tmp)
+            if _finished_stamp(tmp) is None:
+                tmp.unlink()
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                tmp.unlink()
+                return False
+            os.replace(tmp, dest)
+            return True
+        except Exception:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+    return False
+
+
+def fill_missing_from_cloud():
+    """Frozen app only: download CONFIG counties that have no finished file.
+
+    Existing currently-using files are left alone. Timestamps are not compared.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    for state, county in iter_implemented_counties():
+        if current_file_is_ready(state, county):
+            continue
+        try:
+            download_cloud_county_file(state, county)
+        except Exception:
+            pass
 
 
 def _current_file_is_from_this_session(state, county):
@@ -2723,6 +2955,8 @@ def _output_has_search_results():
 
 def on_clean_view_toggle():
     """Re-run the current search so cards redraw in the other format."""
+    if not searches_allowed:
+        return
     if not _output_has_search_results():
         return
     try:
@@ -2736,6 +2970,8 @@ def on_clean_view_toggle():
 
 
 def _on_check_label(variable, command, event=None):
+    if _ui_locked:
+        return "break"
     try:
         variable.set(not bool(variable.get()))
     except (tk.TclError, NameError):
@@ -4314,16 +4550,29 @@ def display_result(feature, index, cfg, county_label=None, hold_state=False, res
 
 # ───────────────────────────── Download / update services ─────────────────────
 def set_searches_allowed(allowed):
-    global searches_allowed, _search_id
+    global searches_allowed, _search_id, _ui_locked
     searches_allowed = bool(allowed)
+    _ui_locked = not searches_allowed
     if not searches_allowed:
         _search_id += 1
         if not _holding_download_status:
             stop_loading()
-    try:
-        search_button.config(state=tk.NORMAL if searches_allowed else tk.DISABLED)
-    except (NameError, tk.TclError):
-        pass
+    state = tk.NORMAL if searches_allowed else tk.DISABLED
+    for widget_name in ("search_button", "name_entry", "address_entry", "links_button"):
+        try:
+            globals()[widget_name].config(state=state)
+        except (KeyError, NameError, tk.TclError):
+            pass
+    for menu_name in ("state_dropdown", "county_dropdown", "map_link_dropdown"):
+        try:
+            globals()[menu_name].set_enabled(searches_allowed)
+        except (KeyError, NameError, AttributeError, tk.TclError):
+            pass
+    for box_name in ("auto_update_box", "clean_view_box"):
+        try:
+            globals()[box_name].config(state=state)
+        except (KeyError, NameError, tk.TclError):
+            pass
 
 
 # Arial 18's bullet sits low in its line box. Geometric centering puts the
@@ -4579,6 +4828,8 @@ def on_auto_update_toggle():
     on the next launch, the same way any unfinished download is removed.
     Turning it back on here wakes the waiting download thread.
     """
+    if not searches_allowed:
+        return
     enabled = bool(auto_update_var.get())
     _write_auto_update_pref(enabled)
     if enabled:
@@ -4752,6 +5003,7 @@ def _finish_startup_check():
         set_searches_allowed(False)
         threading.Thread(target=lambda: initial_download(missing), daemon=True).start()
         return
+    _holding_download_status = False
     stop_loading()
     set_searches_allowed(True)
     note_offline_selection()
@@ -4765,13 +5017,208 @@ def _finish_startup_check():
         pass
 
 
-def begin_data_services():
-    """Clear bad files, adopt finished .py county files, then allow search.
+def _running_app_bundle():
+    """The .app this frozen process is running from, or None in source."""
+    if not getattr(sys, "frozen", False):
+        return None
+    return Path(sys.executable).resolve().parent.parent.parent
 
-    Adoption reads the old JSON files off the main thread. A county that
-    already has a finished SQLite file is left as it is.
+
+def _this_build_id():
+    """CFBundleVersion from this .app, else the executable's mtime and size."""
+    bundle = _running_app_bundle()
+    if bundle is None:
+        return None
+    plist_path = bundle / "Contents" / "Info.plist"
+    try:
+        import plistlib
+        with plist_path.open("rb") as handle:
+            info = plistlib.load(handle)
+        version = str(info.get("CFBundleVersion") or "").strip()
+        if version:
+            return version
+    except Exception:
+        pass
+    try:
+        st = Path(sys.executable).stat()
+        return f"{st.st_mtime_ns}-{st.st_size}"
+    except OSError:
+        return None
+
+
+def _opened_build_path():
+    return _app_support_dir() / "opened_build.txt"
+
+
+def _is_first_launch_of_this_build():
+    """True when this frozen build has not been opened yet.
+
+    County files already in Application Support do not count as this build
+    having been opened. A rebuild writes a new CFBundleVersion, so the next
+    open of that .app is a first launch again.
     """
+    if not getattr(sys, "frozen", False):
+        return False
+    build_id = _this_build_id()
+    if not build_id:
+        return True
+    try:
+        saved = _opened_build_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return True
+    return saved != build_id
+
+
+def _mark_build_opened():
+    build_id = _this_build_id()
+    if not build_id:
+        return
+    path = _opened_build_path()
+    tmp = path.with_name(path.name + ".replacing")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(build_id + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _app_is_in_applications(bundle):
+    if bundle is None:
+        return False
+    dest = Path("/Applications/DataGrabber.app")
+    try:
+        return bundle.resolve() == dest.resolve()
+    except OSError:
+        return False
+
+
+def _osascript_admin(shell_command):
+    script = (
+        "do shell script "
+        + json.dumps(shell_command)
+        + " with administrator privileges"
+    )
+    subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+
+
+def _move_item_to_trash(path):
+    path = Path(path)
+    if not path.exists():
+        return True
+    trash_dir = Path.home() / ".Trash"
+    try:
+        trash_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    stamp = datetime.now().strftime("%Y-%m-%d %H%M%S")
+    dest = trash_dir / f"{path.stem} {stamp}{path.suffix}"
+    try:
+        subprocess.run(
+            ["mv", str(path), str(dest)], check=True, capture_output=True
+        )
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    try:
+        _osascript_admin(f"mv {shlex.quote(str(path))} {shlex.quote(str(dest))}")
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def _install_app_into_applications(src, dest):
+    src = Path(src)
+    dest = Path(dest)
+    if dest.exists() and not _move_item_to_trash(dest):
+        # ditto can still replace an existing bundle
+        pass
+    try:
+        subprocess.run(["ditto", str(src), str(dest)], check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        try:
+            _osascript_admin(
+                f"ditto {shlex.quote(str(src))} {shlex.quote(str(dest))}"
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return False
+    try:
+        subprocess.run(["xattr", "-cr", str(dest)], check=False, capture_output=True)
+    except OSError:
+        pass
+    return dest.is_dir()
+
+
+def _offer_move_to_applications_if_needed():
+    """Ask once per frozen build to move into /Applications.
+
+    Returns True when this process is quitting so Applications can open.
+    """
+    if not getattr(sys, "frozen", False):
+        return False
+    bundle = _running_app_bundle()
+    if bundle is None:
+        return False
+    if _app_is_in_applications(bundle):
+        _mark_build_opened()
+        return False
+    if not _is_first_launch_of_this_build():
+        return False
+    from tkinter import messagebox
+    try:
+        root.update_idletasks()
+        move = messagebox.askyesno(
+            "DataGrabber",
+            "Move DataGrabber to the Applications folder?",
+            parent=root,
+        )
+    except Exception:
+        move = False
+    if not move:
+        _mark_build_opened()
+        return False
+    dest = Path("/Applications/DataGrabber.app")
+    if not _install_app_into_applications(bundle, dest):
+        try:
+            messagebox.showerror(
+                "DataGrabber",
+                "DataGrabber could not be moved to the Applications folder.",
+                parent=root,
+            )
+        except Exception:
+            pass
+        return False
+    _mark_build_opened()
+    try:
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 0.5; open {shlex.quote(str(dest))}"],
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+    os._exit(0)
+    return True
+
+
+def begin_data_services():
+    """First launch of this build may move to Applications, then fill data.
+
+    Order: lock the UI, offer Move to Applications once per build, show
+    Initializing, create folders, migrate/relocate/delete unfinished, adopt
+    legacy .py files, download missing counties from Cloudflare, then ArcGIS
+    for anything still missing. An existing currently-using file is never
+    replaced from the cloud.
+    """
+    global _holding_download_status
+    _holding_download_status = True
     set_searches_allowed(False)
+    if _offer_move_to_applications_if_needed():
+        return
+    start_loading_message("Initializing")
     prepare_storage_access()
     current_data_dir().mkdir(parents=True, exist_ok=True)
 
@@ -4802,6 +5249,7 @@ def begin_data_services():
                     adopt_legacy_county_file(state, county)
                 except Exception:
                     pass
+            fill_missing_from_cloud()
         finally:
             try:
                 root.after(0, _finish_startup_check)
@@ -4860,6 +5308,7 @@ class ChoiceMenu:
         self._typed_at = 0.0
         self._focus_before = None
         self._keyed = []
+        self._enabled = True
         self._sync_button()
         self.variable.trace_add("write", self._sync_button)
         self.button.bind("<Button-1>", self._on_press)
@@ -4880,6 +5329,15 @@ class ChoiceMenu:
     def pack(self, **kwargs):
         self.button.pack(**kwargs)
 
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
+        try:
+            self.button.config(state=tk.NORMAL if self._enabled else tk.DISABLED)
+        except tk.TclError:
+            pass
+        if not self._enabled:
+            self.close()
+
     def set_values(self, values):
         self.values = list(values)
         self.button.config(width=self._button_width)
@@ -4896,6 +5354,8 @@ class ChoiceMenu:
         return "break"
 
     def toggle(self):
+        if not self._enabled or _ui_locked:
+            return
         if self.panel is not None:
             self.close()
         else:
@@ -5358,6 +5818,7 @@ def build_gui():
     global name_entry, address_entry, search_button, loading_dot, loading_label
     global output, links_button, gold_dot, gold_label, gold_row, update_prompt, county_update_line
     global position_loading, auto_update_var, clean_view_var, map_link_type_var, map_link_dropdown
+    global auto_update_box, auto_update_label, clean_view_box, clean_view_label
 
     root = tk.Tk()
     _configure_macos_app(root)
@@ -5376,7 +5837,7 @@ def build_gui():
     # Box and sentence are separate so the box can sit 2px lower on the text.
     # The row is only as wide as the box plus the words, so clicks past the
     # sentence do not toggle it.
-    _pack_labeled_checkbutton(
+    _, auto_update_box, auto_update_label = _pack_labeled_checkbutton(
         status_frame,
         "Allow database auto update?",
         auto_update_var,
@@ -5515,7 +5976,7 @@ def build_gui():
     )
 
     clean_view_var = tk.BooleanVar(value=False)
-    _pack_labeled_checkbutton(
+    _, clean_view_box, clean_view_label = _pack_labeled_checkbutton(
         results_opt_frame,
         "Clean View",
         clean_view_var,
