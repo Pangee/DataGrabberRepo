@@ -1,33 +1,37 @@
 ---
 name: rebuild
 description: >
-  Rebuild DataGrabber.app with the PyInstaller command in DataGrabber.py and
-  put the finished app on the Desktop, trashing any existing Desktop copy
-  first. Never touch /Applications/DataGrabber.app. Use when the user says
-  "rebuild".
+  Rebuild DataGrabber as a Desktop installer DMG with the PyInstaller command
+  in DataGrabber.py. Trash any existing Desktop .app or .dmg first. Never
+  touch /Applications/DataGrabber.app. Use when the user says "rebuild".
 ---
 
 # Rebuild
 
 Run the whole rebuild as **one** shell command. Do not split it into separate checks, listings, or follow-up commands. The user approves once.
 
-Do not edit `~/Desktop/DataGrabber.app` unless the user asked for this rebuild. Outside a rebuild, change the project source only. The Desktop app is replaced only by the command below.
+Do not edit `~/Desktop/DataGrabber.app` or `~/Desktop/DataGrabber.dmg` unless the user asked for this rebuild. Outside a rebuild, change the project source only. The Desktop installer is replaced only by the command below.
 
-Work from the repo root. The PyInstaller output is `dist/DataGrabber.app` inside the project. After a successful build, place that bundle on the Desktop.
+Work from the repo root. The PyInstaller output is `dist/DataGrabber.app` inside the project. After a successful build, wrap that bundle in a drag-to-Applications disk image and put **DataGrabber.dmg** on the Desktop. Do not leave DataGrabber.app on the Desktop.
 
-If `~/Desktop/DataGrabber.app` already exists, move that Desktop copy to the Trash, then copy the new build there. Do not touch `/Applications/DataGrabber.app` or anything else under `/Applications`.
+If `~/Desktop/DataGrabber.app` or `~/Desktop/DataGrabber.dmg` already exists, move that Desktop copy to the Trash, then copy the new installer there. Do not touch `/Applications/DataGrabber.app` or anything else under `/Applications`.
 
-Build first. Only replace the Desktop app after PyInstaller exits successfully, so a failed build leaves the current Desktop app in place.
+Build first. Only replace the Desktop installer after PyInstaller exits successfully, so a failed build leaves the current Desktop installer in place.
 
-Before the old Desktop app is moved to the Trash, copy finished county files from its `Contents/Resources/taxlots_current` into `~/Library/Application Support/DataGrabber/taxlots_current`. Copy a `.sqlite` file only when its `meta` row `finished` is `1`, and check the copy is still finished before the Trash step. Do not copy the bytes' extended attributes. Do not copy `taxlots_update`, `.py` county files, partial files, or unfinished files. If Application Support already has a finished file with the same or a newer stamp, keep that file. Do not put the databases inside the new .app. If that check fails, stop. The current Desktop app stays where it is.
+Before the old Desktop app is moved to the Trash, copy finished county files from its `Contents/Resources/taxlots_current` into `~/Library/Application Support/DataGrabber/taxlots_current`. Copy a `.sqlite` file only when its `meta` row `finished` is `1`, and check the copy is still finished before the Trash step. Do not copy the bytes' extended attributes. Do not copy `taxlots_update`, `.py` county files, partial files, or unfinished files. If Application Support already has a finished file with the same or a newer stamp, keep that file. Do not put the databases inside the new .app. If that check fails, stop. The current Desktop installer stays where it is.
 
 Copy R2 access into `Contents/Resources/r2.json` of the new .app so another Mac can download county files without rclone. Prefer `~/Library/Application Support/DataGrabber/r2.json`, then `rclone.conf` `[r2]`. Do not print the keys. If no keys are found, stop so a Release is not shipped without cloud access.
+
+Read the marketing version from the repo file `VERSION`. Put it in `CFBundleShortVersionString`, `CFBundleVersion`, and `Contents/Resources/VERSION.txt`. Do not edit `VERSION` during a rebuild. The bundle display name stays `DataGrabber`; the .app stays `DataGrabber.app`.
+
+The DMG window is the usual drag-to-Applications installer: DataGrabber.app on the left, Applications on the right. Opening the app from Applications later throws the Desktop/Downloads `.dmg` in the Trash.
 
 ```bash
 set -euo pipefail
 cd "/Users/danielrohr/Documents/Visual Studios Projects/DataGrabber"
 APP_SRC="dist/DataGrabber.app"
 DESKTOP_APP="$HOME/Desktop/DataGrabber.app"
+DESKTOP_DMG="$HOME/Desktop/DataGrabber.dmg"
 APPS_APP="/Applications/DataGrabber.app"
 APPS_MTIME_BEFORE=""
 if [ -e "$APPS_APP" ]; then
@@ -39,7 +43,6 @@ pip install certifi
 pyinstaller --noconfirm --windowed --name "DataGrabber" --osx-bundle-identifier "com.datagrabber.DataGrabber" --icon "DataGrabber.icns" --clean --collect-data certifi DataGrabber.py
 python - << 'PY'
 import plistlib
-from datetime import datetime, timezone
 from pathlib import Path
 
 p = Path("dist/DataGrabber.app/Contents/Info.plist")
@@ -52,13 +55,22 @@ info["NSSupportsAutomaticTermination"] = False
 info["LSMinimumSystemVersion"] = "15.0"
 info["LSMultipleInstancesProhibited"] = True
 info["CFBundleSupportedPlatforms"] = ["MacOSX"]
-# Unique per rebuild so a new Desktop .app is a first launch even when
-# Application Support already has county files from earlier builds.
-info["CFBundleVersion"] = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+info["CFBundleName"] = "DataGrabber"
+info["CFBundleDisplayName"] = "DataGrabber"
+version = Path("VERSION").read_text(encoding="utf-8").strip()
+if not version:
+    raise SystemExit("ERROR: VERSION file is empty")
+# Marketing version from VERSION. Rebuild must not bump that file.
+info["CFBundleShortVersionString"] = version
+info["CFBundleVersion"] = version
+info["CFBundleGetInfoString"] = f"DataGrabber {version}"
 with p.open("wb") as fh:
     plistlib.dump(info, fh)
+note = Path("dist/DataGrabber.app/Contents/Resources/VERSION.txt")
+note.write_text(f"DataGrabber {version}\n", encoding="utf-8")
 print("INFO_PLIST_OK")
-print("CFBundleVersion", info["CFBundleVersion"])
+print("CFBundleShortVersionString", version)
+print("CFBundleVersion", version)
 PY
 python - << 'PY'
 # Ship R2 read keys inside the .app (like certifi) so another Mac can
@@ -220,9 +232,69 @@ if [ -e "$DESKTOP_APP" ]; then
 else
   echo "NO_EXISTING_DESKTOP_APP"
 fi
+if [ -e "$DESKTOP_DMG" ]; then
+  mv "$DESKTOP_DMG" "$HOME/.Trash/DataGrabber $(date '+%Y-%m-%d %H%M%S').dmg"
+  echo "TRASHED_OLD_DESKTOP_DMG"
+else
+  echo "NO_EXISTING_DESKTOP_DMG"
+fi
 
-ditto "$APP_SRC" "$DESKTOP_APP"
-xattr -cr "$DESKTOP_APP"
+# Drag-to-Applications installer. The .app stays inside the DMG, not on Desktop.
+STAGE="$(mktemp -d /tmp/datagrabber-dmg.XXXXXX)"
+RW_DMG="$(mktemp /tmp/datagrabber-rw.XXXXXX).dmg"
+cleanup_dmg() {
+  hdiutil detach "/Volumes/DataGrabber" -force >/dev/null 2>&1 || true
+  rm -rf "$STAGE"
+  rm -f "$RW_DMG"
+}
+trap cleanup_dmg EXIT
+ditto "$APP_SRC" "$STAGE/DataGrabber.app"
+ln -s /Applications "$STAGE/Applications"
+mkdir -p "$STAGE/.background"
+if [ -f "dmg-background.png" ]; then
+  cp "dmg-background.png" "$STAGE/.background/background.png"
+fi
+hdiutil create -volname "DataGrabber" -srcfolder "$STAGE" -ov -fs HFS+ -format UDRW "$RW_DMG"
+hdiutil attach -readwrite -noverify -noautoopen "$RW_DMG"
+n=0
+while [ ! -d "/Volumes/DataGrabber/DataGrabber.app" ]; do
+  n=$((n + 1))
+  if [ "$n" -gt 40 ]; then
+    echo "ERROR: DMG did not mount" >&2
+    exit 1
+  fi
+  sleep 0.25
+done
+if [ -f "/Volumes/DataGrabber/.background/background.png" ]; then
+  osascript << 'APPLESCRIPT' || true
+tell application "Finder"
+  tell disk "DataGrabber"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {200, 120, 888, 520}
+    set theViewOptions to the icon view options of container window
+    set arrangement of theViewOptions to not arranged
+    set icon size of theViewOptions to 128
+    set background picture of theViewOptions to file ".background:background.png"
+    set position of item "DataGrabber.app" of container window to {160, 200}
+    set position of item "Applications" of container window to {520, 200}
+    close
+    open
+    update without registering applications
+    delay 2
+  end tell
+end tell
+APPLESCRIPT
+fi
+bless --folder "/Volumes/DataGrabber" --openfolder "/Volumes/DataGrabber" || true
+sync
+hdiutil detach "/Volumes/DataGrabber"
+hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 -o "$DESKTOP_DMG"
+xattr -cr "$DESKTOP_DMG"
+trap - EXIT
+cleanup_dmg
 
 python - << 'PY'
 import re
@@ -275,8 +347,12 @@ if [ -n "$APPS_MTIME_BEFORE" ]; then
   echo "APPLICATIONS_UNTOUCHED $(stat -f "%Sm %N" -t "%Y-%m-%d %H:%M:%S" "$APPS_APP")"
 fi
 
-echo "DESKTOP_OK"
-ls -ld "$DESKTOP_APP"
+if [ -e "$DESKTOP_APP" ]; then
+  echo "ERROR: Desktop still has DataGrabber.app" >&2
+  exit 1
+fi
+echo "DESKTOP_DMG_OK"
+ls -ld "$DESKTOP_DMG"
 ```
 
-Tell the user the Desktop path when it finishes. Say whether a previous Desktop copy was trashed. Confirm the Applications bundle was not modified.
+Tell the user the Desktop **DataGrabber.dmg** path when it finishes. Say whether a previous Desktop app or installer was trashed. Confirm the Applications bundle was not modified. Tell them to double-click the disk image and drag DataGrabber into Applications.

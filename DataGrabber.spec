@@ -60,5 +60,7 @@ app = BUNDLE(
         'LSMinimumSystemVersion': '15.0',
         'LSMultipleInstancesProhibited': True,
         'CFBundleSupportedPlatforms': ['MacOSX'],
+        'CFBundleName': 'DataGrabber',
+        'CFBundleDisplayName': 'DataGrabber',
     },
 )

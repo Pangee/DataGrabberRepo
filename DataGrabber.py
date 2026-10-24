@@ -10,8 +10,8 @@ Google Maps and Zillow links.
 If any changes are made to this main python file it must be rebuilt using the Visual Studio terminal. Simply paste the following commands in and confirm the replace warnings:
 source venv/bin/activate && pip install certifi && pyinstaller --noconfirm --windowed --name "DataGrabber" --osx-bundle-identifier "com.datagrabber.DataGrabber" --icon "DataGrabber.icns" --clean --collect-data certifi DataGrabber.py && xattr -cr dist/DataGrabber.app
 
-Or just tell grok "rebuild" and it will throw an updated build into your desktop replacing any old builds that already exist there.
-Before the old Desktop app is moved to the Trash, its finished county databases are copied into ~/Library/Application Support/DataGrabber and checked so they stay finished. The running app keeps its databases there, so updates work wherever the .app is stored.
+Or just tell grok "rebuild" and it will throw an installer (DataGrabber.dmg) onto the Desktop, replacing any old Desktop installer or .app. Double-click the disk image and drag DataGrabber into Applications. Opening it from Applications throws the installer in the Trash.
+Before an old Desktop app is moved to the Trash, its finished county databases are copied into ~/Library/Application Support/DataGrabber and checked so they stay finished. The running app keeps its databases there, so updates work wherever the .app is stored.
 
 To commit a github repo update from this device paste the following into Visual Studio's terminal:
 git add DataGrabber.py
@@ -84,7 +84,8 @@ import os
 import sys
 import hashlib
 import hmac
-import shlex
+import http.client
+import socket
 
 # Homebrew Tk 9 prints deprecation noise on newer macOS (Tahoe included).
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
@@ -103,9 +104,10 @@ import ssl
 import subprocess
 import urllib.request
 import urllib.error
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, quote_plus, urlencode, urlparse
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlparse
 
 # ── SSL certificates for the frozen .app ──────────────────────────────────
 # PyInstaller bundles do not always find macOS system CA certs, so every
@@ -1168,15 +1170,19 @@ def _copy_data_file(src, dst):
 
 
 def _finished_stamp(path):
+    """Updated stamp when the file is a finished county database.
+
+    Temp downloads are named *.sqlite.replacing, so the suffix is not
+    .sqlite. Peek the bytes anyway.
+    """
     path = Path(path)
     if not path.is_file():
         return None
-    if path.suffix == ".sqlite":
-        header = peek_county_header(path)
-    elif path.suffix == ".py":
+    name = _county_filename_stem(path.name)
+    if name.endswith(".py") or path.suffix == ".py":
         header = _peek_py_header(path)
     else:
-        return None
+        header = peek_county_header(path)
     if not header or not header[1]:
         return None
     return header[0]
@@ -1831,21 +1837,55 @@ def _r2_credentials():
     return None
 
 
+def _cloud_object_key(state, county):
+    folder = _name_token(state)
+    return f"{CLOUD_PACK_S3_PREFIX}/{folder}/{county_file_name(state, county)}"
+
+
+def _cloud_object_url(state, county):
+    return (
+        f"{CLOUD_PACK_S3_ENDPOINT.rstrip('/')}/"
+        f"{CLOUD_PACK_S3_BUCKET}/{_cloud_object_key(state, county)}"
+    )
+
+
+def _xml_local(tag):
+    if tag is None:
+        return ""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
 def _hmac_sha256(key, msg):
+    if isinstance(key, str):
+        key = key.encode("utf-8")
     if isinstance(msg, str):
         msg = msg.encode("utf-8")
     return hmac.new(key, msg, hashlib.sha256).digest()
 
 
-def _signed_s3_request(url, access_key, secret_key, region="auto"):
-    """AWS SigV4 GET for Cloudflare R2. Payload is unsigned."""
+def _aws_sigv4_headers(method, url, creds):
+    """AWS Signature Version 4 headers for R2. Region auto, UNSIGNED-PAYLOAD.
+
+    Cloudflare R2 is S3-compatible and requires x-amz-content-sha256 on every
+    request. Object Read tokens are enough for ListObjectsV2 and GetObject.
+    """
+    access, secret = creds
     parsed = urlparse(url)
     host = parsed.netloc
-    canonical_uri = quote(parsed.path or "/", safe="/-_.~")
-    canonical_query = parsed.query or ""
+    raw_path = parsed.path or "/"
+    encoded_path = "/".join(quote(segment, safe="~") for segment in raw_path.split("/"))
+    if not encoded_path.startswith("/"):
+        encoded_path = "/" + encoded_path
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    canonical_query = "&".join(
+        f"{quote(key, safe='~')}={quote(value, safe='~')}"
+        for key, value in sorted(pairs, key=lambda item: item[0])
+    )
     now = datetime.now(timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
-    date_stamp = now.strftime("%Y%m%d")
+    datestamp = now.strftime("%Y%m%d")
     payload_hash = "UNSIGNED-PAYLOAD"
     canonical_headers = (
         f"host:{host}\n"
@@ -1853,135 +1893,263 @@ def _signed_s3_request(url, access_key, secret_key, region="auto"):
         f"x-amz-date:{amz_date}\n"
     )
     signed_headers = "host;x-amz-content-sha256;x-amz-date"
-    canonical_request = "\n".join((
-        "GET",
-        canonical_uri,
-        canonical_query,
-        canonical_headers,
-        signed_headers,
-        payload_hash,
-    ))
-    algorithm = "AWS4-HMAC-SHA256"
-    credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
-    string_to_sign = "\n".join((
-        algorithm,
-        amz_date,
-        credential_scope,
-        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
-    ))
-    signing_key = _hmac_sha256(
-        _hmac_sha256(
-            _hmac_sha256(
-                _hmac_sha256(("AWS4" + secret_key).encode("utf-8"), date_stamp),
-                region,
-            ),
-            "s3",
-        ),
-        "aws4_request",
+    canonical_request = (
+        f"{method}\n{encoded_path}\n{canonical_query}\n"
+        f"{canonical_headers}\n{signed_headers}\n{payload_hash}"
     )
+    scope = f"{datestamp}/auto/s3/aws4_request"
+    string_to_sign = (
+        "AWS4-HMAC-SHA256\n"
+        f"{amz_date}\n{scope}\n"
+        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
+    k_date = _hmac_sha256("AWS4" + secret, datestamp)
+    k_region = _hmac_sha256(k_date, "auto")
+    k_service = _hmac_sha256(k_region, "s3")
+    k_signing = _hmac_sha256(k_service, "aws4_request")
     signature = hmac.new(
-        signing_key, string_to_sign.encode("utf-8"), hashlib.sha256
+        k_signing, string_to_sign.encode("utf-8"), hashlib.sha256
     ).hexdigest()
-    authorization = (
-        f"{algorithm} Credential={access_key}/{credential_scope}, "
-        f"SignedHeaders={signed_headers}, Signature={signature}"
-    )
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Host", host)
-    req.add_header("x-amz-date", amz_date)
-    req.add_header("x-amz-content-sha256", payload_hash)
-    req.add_header("Authorization", authorization)
-    req.add_header("Accept-Encoding", "identity")
-    return req
+    return {
+        "Host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+        "Authorization": (
+            f"AWS4-HMAC-SHA256 Credential={access}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+    }
 
 
-def _stream_http_to_path(req, dest):
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+def _r2_https_call(method, url, creds, dest=None, timeout=60):
+    """Signed HTTPS call. Returns (status, body_or_None). 0 on transport failure.
+
+    When dest is set, a 200 body is streamed to that path and body_or_None is
+    None. Caller deletes dest on non-200.
+    """
+    parsed = urlparse(url)
+    headers = _aws_sigv4_headers(method, url, creds)
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
     try:
-        with _urlopen(req, timeout=300) as response:
-            expected = response.headers.get("Content-Length")
-            expected_n = int(expected) if expected and str(expected).isdigit() else None
-            with open(dest, "wb") as handle:
+        conn = http.client.HTTPSConnection(
+            parsed.hostname,
+            parsed.port or 443,
+            context=_SSL_CONTEXT,
+            timeout=timeout,
+        )
+        try:
+            conn.request(method, target, headers=headers)
+            resp = conn.getresponse()
+            status = int(resp.status)
+            if dest is None:
+                body = resp.read()
+                return status, body
+            dest = Path(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if status != 200:
+                resp.read()
+                return status, None
+            with dest.open("wb") as handle:
                 while True:
-                    chunk = response.read(1024 * 1024)
+                    chunk = resp.read(1024 * 1024)
                     if not chunk:
                         break
                     handle.write(chunk)
-        if expected_n is not None and dest.stat().st_size != expected_n:
-            raise OSError("incomplete cloud download")
-    except Exception:
+            return status, None
+        finally:
+            conn.close()
+    except (OSError, ssl.SSLError, socket.timeout, http.client.HTTPException, TimeoutError):
+        return 0, None
+
+
+def _cloud_list_keys(creds):
+    """Object keys under taxlots_current/, or None when the list call fails.
+
+    One list tells the app which counties are on Cloudflare. Counties not in
+    the list are missing on R2. ArcGIS runs for those later, with no notice.
+    """
+    keys = set()
+    token = None
+    endpoint = CLOUD_PACK_S3_ENDPOINT.rstrip("/")
+    bucket = CLOUD_PACK_S3_BUCKET
+    prefix = CLOUD_PACK_S3_PREFIX.rstrip("/") + "/"
+    for _ in range(20):
+        params = [("list-type", "2"), ("max-keys", "1000"), ("prefix", prefix)]
+        if token:
+            params.append(("continuation-token", token))
+        query = urlencode(params)
+        url = f"{endpoint}/{bucket}?{query}"
+        status, body = _r2_https_call("GET", url, creds, timeout=60)
+        if status != 200 or not body:
+            return None
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            return None
+        truncated = False
+        next_token = None
+        for el in root.iter():
+            name = _xml_local(el.tag)
+            if name == "Key":
+                text = (el.text or "").strip()
+                if text.endswith(".sqlite"):
+                    keys.add(text)
+            elif name == "IsTruncated":
+                truncated = (el.text or "").strip().lower() == "true"
+            elif name == "NextContinuationToken":
+                next_token = (el.text or "").strip() or None
+        if not truncated:
+            return keys
+        if not next_token:
+            return keys
+        token = next_token
+    return keys
+
+
+def _cloud_get_file(url, dest, creds):
+    """Write url to dest. Returns HTTP status string: 200, 404, or 000."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if dest.exists():
+            dest.unlink()
+    except OSError:
+        return "000"
+    if creds:
+        status, _body = _r2_https_call("GET", url, creds, dest=dest, timeout=3600)
+        code = f"{status:03d}" if status else "000"
+    else:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with _urlopen(req, timeout=3600) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                if status != 200:
+                    return f"{status:03d}"
+                with dest.open("wb") as handle:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+            code = "200"
+        except urllib.error.HTTPError as exc:
+            try:
+                if dest.exists():
+                    dest.unlink()
+            except OSError:
+                pass
+            return f"{int(exc.code):03d}"
+        except (OSError, ssl.SSLError, socket.timeout, TimeoutError, urllib.error.URLError):
+            try:
+                if dest.exists():
+                    dest.unlink()
+            except OSError:
+                pass
+            return "000"
+    if code != "200" or not dest.is_file() or dest.stat().st_size < 1:
         try:
             if dest.exists():
                 dest.unlink()
         except OSError:
             pass
-        raise
+        return code if code != "200" else "000"
+    return code
 
 
-def download_cloud_county_file(state, county):
-    """Copy one missing county file from R2. Never replace a file already on disk."""
-    dest = county_file_path(current_data_dir(), state, county)
-    if dest.exists():
+def _install_cloud_temp(tmp, dest):
+    """Keep dest only when tmp is a finished county file."""
+    if _finished_stamp(tmp) is None:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
         return False
-    tmp = dest.with_name(dest.name + ".replacing")
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     try:
-        if tmp.exists():
-            tmp.unlink()
+        os.replace(tmp, dest)
     except OSError:
-        pass
-    folder = _name_token(state)
-    filename = county_file_name(state, county)
-    attempts = []
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _try_cloud_county(state, county, present):
+    """saved, absent, or failed.
+
+    present True: the object is on Cloudflare; download it. Failure is silent
+    and ArcGIS runs later. present False: skip with no notice. present None:
+    GET once; 404 is absent, any other miss is failed.
+    """
+    if current_file_is_ready(state, county):
+        return "saved"
+    if present is False:
+        return "absent"
+    dest = county_file_path(current_data_dir(), state, county)
+    tmp = dest.with_name(dest.name + ".replacing")
+    creds = _r2_credentials()
+    urls = []
     base = (CLOUD_PACK_BASE_URL or "").strip().rstrip("/")
     if base:
-        attempts.append((f"{base}/{folder}/{filename}", None))
-    creds = _r2_credentials()
+        folder = _name_token(state)
+        urls.append((f"{base}/{folder}/{county_file_name(state, county)}", None))
     if creds:
-        s3_url = (
-            f"{CLOUD_PACK_S3_ENDPOINT.rstrip('/')}/"
-            f"{CLOUD_PACK_S3_BUCKET}/{CLOUD_PACK_S3_PREFIX}/"
-            f"{folder}/{filename}"
+        urls.append((_cloud_object_url(state, county), creds))
+    if not urls:
+        return "failed"
+    if present is True:
+        _show_loading_status(
+            f"Downloading {county} in {state} from Cloudflare"
         )
-        attempts.append((s3_url, creds))
-    for url, signed in attempts:
-        try:
-            if signed:
-                req = _signed_s3_request(url, signed[0], signed[1])
-            else:
-                req = urllib.request.Request(url, method="GET")
-                req.add_header("Accept-Encoding", "identity")
-            _stream_http_to_path(req, tmp)
-            if _finished_stamp(tmp) is None:
-                tmp.unlink()
-                continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
-                tmp.unlink()
-                return False
-            os.replace(tmp, dest)
-            return True
-        except Exception:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
-    return False
+    last_code = "000"
+    for url, url_creds in urls:
+        code = _cloud_get_file(url, tmp, url_creds)
+        last_code = code
+        if code == "404":
+            continue
+        if code != "200":
+            return "failed"
+        if present is not True:
+            _show_loading_status(
+                f"Downloading {county} in {state} from Cloudflare"
+            )
+        if _install_cloud_temp(tmp, dest) and current_file_is_ready(state, county):
+            return "saved"
+        return "failed"
+    if present is True:
+        return "failed"
+    if last_code == "404":
+        return "absent"
+    return "failed"
 
 
 def fill_missing_from_cloud():
-    """Frozen app only: download CONFIG counties that have no finished file.
+    """Frozen app only. List R2, then GET each missing county that is on it.
 
-    Existing currently-using files are left alone. Timestamps are not compared.
+    Not on Cloudflare, or on Cloudflare but not saved as a finished file:
+    silent, ArcGIS later. A results-window notice is only for ArcGIS failure.
     """
     if not getattr(sys, "frozen", False):
         return
+    creds = _r2_credentials()
+    listed = _cloud_list_keys(creds) if creds else None
     for state, county in iter_implemented_counties():
         if current_file_is_ready(state, county):
             continue
+        key = _cloud_object_key(state, county)
+        if listed is None:
+            present = None
+        else:
+            present = key in listed
         try:
-            download_cloud_county_file(state, county)
+            _try_cloud_county(state, county, present)
         except Exception:
             pass
 
@@ -2679,10 +2847,10 @@ def _county_in_state(state, county):
 
 
 def offline_county_message(county, state=None):
-    place = _county_in_state(state, county) if state else county
+    name = _county_sentence_name(county)
     return (
-        f"{place} cannot be displayed because it could not be downloaded because its database is offline, "
-        "so it cannot be searched.\n"
+        f"{name} county could not be downloaded, its ArcGIS taxlot database "
+        "is currently down.\n"
     )
 
 
@@ -2762,14 +2930,17 @@ def statewide_result_header_lines(
         lines.extend(zero_counties)
         lines.append("")
     hit_counties = len(county_counts)
-    lines.append(
-        f"{total} {_count_noun(total, 'result')} found in {hit_counties} "
-        f"{_count_noun(hit_counties, 'county', 'counties')}:"
-    )
-    for cname in all_county_names:
-        if cname in county_counts:
-            cnt = county_counts[cname]
-            lines.append(f"{cnt} {_count_noun(cnt, 'result')} found in {cname}")
+    if total:
+        lines.append(
+            f"{total} {_count_noun(total, 'result')} found in {hit_counties} "
+            f"{_count_noun(hit_counties, 'county', 'counties')}:"
+        )
+        for cname in all_county_names:
+            if cname in county_counts:
+                cnt = county_counts[cname]
+                lines.append(f"{cnt} {_count_noun(cnt, 'result')} found in {cname}")
+    else:
+        lines.append("No matching properties found.")
     return lines
 
 
@@ -2849,17 +3020,20 @@ def countrywide_summary_lines(n_missing, n_unavail, n_zero, total, hit_states, c
             f"did not return any results."
         ),
         "",
-        (
+    ]
+    if total:
+        lines.append(
             f"{total} {_count_noun(total, 'result')} found in "
             f"{hit_states} {_count_noun(hit_states, 'state')} and "
             f"{len(county_hits)} {_count_noun(len(county_hits), 'county', 'counties')}:"
-        ),
-    ]
-    for state, county, count in county_hits:
-        name = _county_sentence_name(county)
-        lines.append(
-            f"{state}: {count} {_count_noun(count, 'result')} found in {name} county."
         )
+        for state, county, count in county_hits:
+            name = _county_sentence_name(county)
+            lines.append(
+                f"{state}: {count} {_count_noun(count, 'result')} found in {name} county."
+            )
+    else:
+        lines.append("No matching properties found.")
     return lines
 
 
@@ -3470,6 +3644,19 @@ def clear_entry_selections(event=None):
         pass
 
 
+def _show_loading_status(text):
+    """Set the red loading line from any thread."""
+    def go(t=text):
+        try:
+            start_loading_message(t)
+        except (NameError, tk.TclError):
+            pass
+    try:
+        root.after(0, go)
+    except (NameError, tk.TclError):
+        go()
+
+
 def start_loading_message(text):
     global is_loading, blink_job
     loading_label.config(text=text)
@@ -3640,6 +3827,17 @@ def search_name():
                     if (st, cname) in county_counts
                 ]
                 hit_states = len({st for st, _cname, _cnt in county_hits})
+                if not all_results:
+                    msg = "\n".join(
+                        countrywide_summary_lines(
+                            len(missing_counties), n_unavail, n_zero,
+                            true_total, hit_states, county_hits,
+                        )
+                    ) + "\n"
+                    root.after(0, lambda m=msg: (
+                        _show_pinned_message(m, [], my_id),
+                    ) if still_current() else None)
+                    return
                 total_results = len(all_results)
                 displayed_results = 0
 
@@ -3715,16 +3913,14 @@ def search_name():
                 true_total = sum(county_counts.values())
                 overflow = true_total > RESULT_DISPLAY_CAP or more
                 preface_lines = statewide_preface_lines(stale_lines, missing_counties)
-                if not all_results and not preface_lines:
-                    msg = "No matching properties found.\n"
+                if not all_results:
+                    empty = "No matching properties found.\n"
+                    if preface_lines:
+                        msg = "\n".join(preface_lines) + "\n\n" + empty
+                    else:
+                        msg = empty
                     root.after(0, lambda m=msg: (
                         _show_pinned_message(m, [], my_id),
-                    ) if still_current() else None)
-                    return
-                if not all_results:
-                    msg = "\n".join(preface_lines) + "\n"
-                    root.after(0, lambda m=msg, notes=[]: (
-                        _show_pinned_message(m, notes, my_id),
                     ) if still_current() else None)
                     return
 
@@ -4783,8 +4979,8 @@ def on_app_focus_change(event=None):
 
 def initial_download(missing):
     for state, county in missing:
-        place = _county_in_state(state, county)
-        root.after(0, lambda p=place: start_loading_message(f"Downloading {p}"))
+        _show_loading_status(f"Downloading {county} in {state} from ArcGIS")
+        time.sleep(0.15)
         path = county_file_path(current_data_dir(), state, county)
         try:
             download_county_file(CONFIG[state][county], path, polite=False)
@@ -5035,200 +5231,135 @@ def _running_app_bundle():
     return Path(sys.executable).resolve().parent.parent.parent
 
 
-def _this_build_id():
-    """CFBundleVersion from this .app, else the executable's mtime and size."""
-    bundle = _running_app_bundle()
-    if bundle is None:
-        return None
-    plist_path = bundle / "Contents" / "Info.plist"
-    try:
-        import plistlib
-        with plist_path.open("rb") as handle:
-            info = plistlib.load(handle)
-        version = str(info.get("CFBundleVersion") or "").strip()
-        if version:
-            return version
-    except Exception:
-        pass
-    try:
-        st = Path(sys.executable).stat()
-        return f"{st.st_mtime_ns}-{st.st_size}"
-    except OSError:
-        return None
-
-
-def _opened_build_path():
-    return _app_support_dir() / "opened_build.txt"
-
-
-def _is_first_launch_of_this_build():
-    """True when this frozen build has not been opened yet.
-
-    County files already in Application Support do not count as this build
-    having been opened. A rebuild writes a new CFBundleVersion, so the next
-    open of that .app is a first launch again.
-    """
-    if not getattr(sys, "frozen", False):
-        return False
-    build_id = _this_build_id()
-    if not build_id:
-        return True
-    try:
-        saved = _opened_build_path().read_text(encoding="utf-8").strip()
-    except OSError:
-        return True
-    return saved != build_id
-
-
-def _mark_build_opened():
-    build_id = _this_build_id()
-    if not build_id:
-        return
-    path = _opened_build_path()
-    tmp = path.with_name(path.name + ".replacing")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(build_id + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
+def _applications_bundle():
+    return Path("/Applications/DataGrabber.app")
 
 
 def _app_is_in_applications(bundle):
     if bundle is None:
         return False
-    dest = Path("/Applications/DataGrabber.app")
     try:
-        return bundle.resolve() == dest.resolve()
+        return Path(bundle).resolve() == _applications_bundle().resolve()
     except OSError:
         return False
 
 
-def _osascript_admin(shell_command):
-    script = (
-        "do shell script "
-        + json.dumps(shell_command)
-        + " with administrator privileges"
-    )
-    subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
-
-
-def _move_item_to_trash(path):
-    path = Path(path)
-    if not path.exists():
-        return True
-    trash_dir = Path.home() / ".Trash"
+def _same_path(a, b):
     try:
-        trash_dir.mkdir(parents=True, exist_ok=True)
+        return Path(a).resolve() == Path(b).resolve()
     except OSError:
-        pass
+        return False
+
+
+def _unique_trash_destination(name):
+    trash = Path.home() / ".Trash"
+    trash.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d %H%M%S")
-    dest = trash_dir / f"{path.stem} {stamp}{path.suffix}"
+    n = 0
+    while True:
+        suffix = "" if n == 0 else f"-{n}"
+        dest = trash / f"{Path(name).stem} {stamp}-{os.getpid()}{suffix}{Path(name).suffix}"
+        if not dest.exists():
+            return dest
+        n += 1
+        if n > 50:
+            return trash / f"{Path(name).stem} {stamp}-{os.getpid()}-{time.time_ns()}{Path(name).suffix}"
+
+
+def _finder_trash(path):
+    posix = str(Path(path))
+    script = (
+        "tell application \"Finder\"\n"
+        "try\n"
+        f"set p to POSIX file {json.dumps(posix)} as alias\n"
+        "delete p\n"
+        "end try\n"
+        "end tell"
+    )
     try:
         subprocess.run(
-            ["mv", str(path), str(dest)], check=True, capture_output=True
+            ["/usr/bin/osascript", "-e", script],
+            capture_output=True,
+            timeout=30,
+            check=False,
         )
-        return True
-    except (OSError, subprocess.CalledProcessError):
-        pass
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     try:
-        _osascript_admin(f"mv {shlex.quote(str(path))} {shlex.quote(str(dest))}")
-        return True
-    except (OSError, subprocess.CalledProcessError):
+        return not Path(path).exists()
+    except OSError:
         return False
 
 
-def _install_app_into_applications(src, dest):
-    src = Path(src)
-    dest = Path(dest)
-    if dest.exists() and not _move_item_to_trash(dest):
-        # ditto can still replace an existing bundle
-        pass
+def _move_to_user_trash(path):
+    """Put path in ~/.Trash. Never touches /Applications/DataGrabber.app."""
+    path = Path(path)
     try:
-        subprocess.run(["ditto", str(src), str(dest)], check=True, capture_output=True)
-    except (OSError, subprocess.CalledProcessError):
-        try:
-            _osascript_admin(
-                f"ditto {shlex.quote(str(src))} {shlex.quote(str(dest))}"
-            )
-        except (OSError, subprocess.CalledProcessError):
-            return False
+        if not path.exists():
+            return True
+    except OSError:
+        return False
+    if _same_path(path, _applications_bundle()):
+        return True
     try:
-        subprocess.run(["xattr", "-cr", str(dest)], check=False, capture_output=True)
+        dest = _unique_trash_destination(path.name)
+        os.rename(str(path), str(dest))
+        return not path.exists()
     except OSError:
         pass
-    return dest.is_dir()
+    return _finder_trash(path)
 
 
-def _offer_move_to_applications_if_needed():
-    """Ask once per frozen build to move into /Applications.
+def _detach_installer_volumes():
+    for name in ("DataGrabber", "DataGrabber Installer", "Install DataGrabber"):
+        volume = Path("/Volumes") / name
+        if not volume.exists():
+            continue
+        try:
+            subprocess.run(
+                ["/usr/bin/hdiutil", "detach", str(volume), "-force"],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
-    Returns True when this process is quitting so Applications can open.
+
+def _cleanup_installer():
+    """After the user drags the app into Applications, throw away the installer.
+
+    The rebuild puts DataGrabber.dmg on the Desktop. Launching the Applications
+    copy unmounts the disk image and moves the .dmg (and leftover Desktop or
+    Downloads .app) to Trash.
     """
     if not getattr(sys, "frozen", False):
-        return False
-    bundle = _running_app_bundle()
-    if bundle is None:
-        return False
-    if _app_is_in_applications(bundle):
-        _mark_build_opened()
-        return False
-    if not _is_first_launch_of_this_build():
-        return False
-    from tkinter import messagebox
-    try:
-        root.update_idletasks()
-        move = messagebox.askyesno(
-            "DataGrabber",
-            "Move DataGrabber to the Applications folder?",
-            parent=root,
-        )
-    except Exception:
-        move = False
-    if not move:
-        _mark_build_opened()
-        return False
-    dest = Path("/Applications/DataGrabber.app")
-    if not _install_app_into_applications(bundle, dest):
-        try:
-            messagebox.showerror(
-                "DataGrabber",
-                "DataGrabber could not be moved to the Applications folder.",
-                parent=root,
-            )
-        except Exception:
-            pass
-        return False
-    _mark_build_opened()
-    try:
-        subprocess.Popen(
-            ["bash", "-c", f"sleep 0.5; open {shlex.quote(str(dest))}"],
-            start_new_session=True,
-        )
-    except OSError:
-        pass
-    os._exit(0)
-    return True
+        return
+    if not _app_is_in_applications(_running_app_bundle()):
+        return
+    _detach_installer_volumes()
+    for path in (
+        Path.home() / "Desktop" / "DataGrabber.dmg",
+        Path.home() / "Downloads" / "DataGrabber.dmg",
+        Path.home() / "Desktop" / "DataGrabber.app",
+        Path.home() / "Downloads" / "DataGrabber.app",
+    ):
+        _move_to_user_trash(path)
 
 
 def begin_data_services():
-    """First launch of this build may move to Applications, then fill data.
+    """Fill county files, then search.
 
-    Order: lock the UI, offer Move to Applications once per build, show
-    Initializing, create folders, migrate/relocate/delete unfinished, adopt
-    legacy .py files, download missing counties from Cloudflare, then ArcGIS
-    for anything still missing. An existing currently-using file is never
-    replaced from the cloud.
+    Order: lock the UI, throw away the installer DMG when running from
+    Applications, show Initializing, create folders, migrate/relocate/delete
+    unfinished, adopt legacy .py files, download missing counties from
+    Cloudflare, then ArcGIS for anything still missing. An existing
+    currently-using file is never replaced from the cloud.
     """
     global _holding_download_status
     _holding_download_status = True
     set_searches_allowed(False)
-    if _offer_move_to_applications_if_needed():
-        return
+    _cleanup_installer()
     start_loading_message("Initializing")
     prepare_storage_access()
     current_data_dir().mkdir(parents=True, exist_ok=True)
