@@ -1,0 +1,9 @@
+venv/
+dist/
+build/
+Backup/
+__pycache__/
+*.pyc
+.DS_Store
+*.sqlite
+*.app

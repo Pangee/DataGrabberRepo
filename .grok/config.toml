@@ -1,0 +1,18 @@
+# In-project edits and commands run without an approval prompt.
+# A command or edit that reaches the Desktop, Trash, or /Applications still asks.
+# Loaded when a session starts. This file does not change other projects.
+
+[permission]
+allow = [
+  "Edit(./**)",
+  "Read(./**)",
+  "Bash(*)",
+]
+ask = [
+  "Bash(*Desktop*)",
+  "Bash(*Trash*)",
+  "Bash(*/Applications*)",
+  "Edit(/Users/danielrohr/Desktop/**)",
+  "Edit(/Users/danielrohr/.Trash/**)",
+  "Edit(/Applications/**)",
+]
