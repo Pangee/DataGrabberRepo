@@ -1150,13 +1150,13 @@ def migrate_bundled_taxlots(bundle_resources, support_dir):
     dst_dir = Path(support_dir) / "taxlots_current"
     dst_dir.mkdir(parents=True, exist_ok=True)
     copied = 0
-    for src in src_dir.iterdir():
+    for src in src_dir.rglob("*"):
         if not src.is_file() or src.suffix not in {".sqlite", ".py"}:
             continue
         src_stamp = _finished_stamp(src)
         if src_stamp is None:
             continue
-        dst = dst_dir / src.name
+        dst = _county_dest_path(dst_dir, src.name)
         dst_stamp = _finished_stamp(dst)
         if dst_stamp is not None and dst_stamp >= src_stamp:
             continue
@@ -1251,7 +1251,89 @@ def county_file_name(state, county):
 
 
 def county_file_path(directory, state, county):
-    return Path(directory) / county_file_name(state, county)
+    return Path(directory) / _name_token(state) / county_file_name(state, county)
+
+
+def _county_filename_stem(name):
+    """oregon-jackson.sqlite from a county file or a sqlite sidecar."""
+    name = Path(name).name
+    if name.endswith(".replacing"):
+        name = name[: -len(".replacing")]
+    elif name.endswith("-journal"):
+        name = name[: -len("-journal")]
+    elif name.endswith("-wal"):
+        name = name[: -len("-wal")]
+    elif name.endswith("-shm"):
+        name = name[: -len("-shm")]
+    return name
+
+
+def _county_dest_path(directory, filename):
+    """taxlots_current/oregon/oregon-jackson.sqlite from a county filename."""
+    name = Path(filename).name
+    stem = _county_filename_stem(name)
+    if stem.endswith(".sqlite"):
+        key = stem[: -len(".sqlite")]
+    elif stem.endswith(".py"):
+        key = stem[: -len(".py")]
+    else:
+        key = Path(stem).stem
+    folder = key.split("-", 1)[0] if "-" in key else key
+    return Path(directory) / folder / name
+
+
+def relocate_county_files(directory):
+    """Move flat (or misplaced) county files into lowercase state folders."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        return
+    for path in list(directory.rglob("*")):
+        if not path.is_file():
+            continue
+        name = path.name
+        if path.suffix not in {".sqlite", ".py"} and not name.endswith(
+            (".replacing", "-journal", "-wal", "-shm")
+        ):
+            continue
+        dest = _county_dest_path(directory, name)
+        try:
+            if path.resolve() == dest.resolve():
+                continue
+        except OSError:
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            src_stamp = _finished_stamp(path) if path.suffix in {".sqlite", ".py"} else None
+            dst_stamp = _finished_stamp(dest) if dest.suffix in {".sqlite", ".py"} else None
+            if dst_stamp is not None and (src_stamp is None or dst_stamp >= src_stamp):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+        try:
+            os.replace(path, dest)
+        except OSError:
+            pass
+    _prune_empty_dirs(directory)
+
+
+def _prune_empty_dirs(directory):
+    directory = Path(directory)
+    if not directory.is_dir():
+        return
+    for path in sorted(directory.rglob("*"), reverse=True):
+        if not path.is_dir() or path == directory:
+            continue
+        try:
+            next(path.iterdir())
+        except StopIteration:
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+        except OSError:
+            pass
 
 
 def iter_implemented_counties():
@@ -1588,7 +1670,7 @@ def delete_unfinished_files(directory):
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    for path in list(directory.iterdir()):
+    for path in list(directory.rglob("*")):
         if not path.is_file():
             continue
         name = path.name
@@ -1611,6 +1693,7 @@ def delete_unfinished_files(directory):
             path.unlink()
         except OSError:
             pass
+    _prune_empty_dirs(directory)
 
 
 def clear_directory(directory):
@@ -4673,6 +4756,7 @@ def begin_data_services():
                     migrate_bundled_taxlots(bundle, _app_support_dir())
                 except OSError:
                     pass
+            relocate_county_files(current_data_dir())
             delete_unfinished_files(current_data_dir())
             clear_directory(update_data_dir())
             for state, county in iter_implemented_counties():

@@ -78,10 +78,18 @@ if not src_dir.is_dir():
     print("NO_CURRENT_TAXLOTS")
     raise SystemExit(0)
 
-finished_files = [path for path in src_dir.iterdir() if path.is_file() and path.suffix == ".sqlite" and header(path)]
+def dest_for(src):
+    name = src.name
+    key = name[:-7] if name.endswith(".sqlite") else Path(name).stem
+    folder = key.split("-", 1)[0] if "-" in key else key
+    return dst_dir / folder / name
+
+finished_files = [
+    path for path in src_dir.rglob("*.sqlite") if path.is_file() and header(path)
+]
 skipped = [
-    path.name for path in src_dir.iterdir()
-    if path.is_file() and path.suffix == ".sqlite" and not header(path)
+    path.name for path in src_dir.rglob("*.sqlite")
+    if path.is_file() and not header(path)
 ]
 if not finished_files:
     print("NO_FINISHED_TAXLOTS")
@@ -93,12 +101,13 @@ dst_dir.mkdir(parents=True, exist_ok=True)
 copied = 0
 kept = 0
 for src in finished_files:
-    dst = dst_dir / src.name
+    dst = dest_for(src)
     src_stamp = header(src)
     dst_stamp = header(dst) if dst.is_file() else None
     if dst_stamp is not None and dst_stamp >= src_stamp:
         kept += 1
         continue
+    dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dst)
     if dst.stat().st_size != src.stat().st_size or header(dst) != src_stamp:
         print(f"ERROR: {src.name} was not finished after copy", file=sys.stderr)
@@ -153,7 +162,7 @@ def is_finished(path):
     return finished[0] == "1"
 
 count = 0
-for path in support_dir.glob("*.sqlite"):
+for path in support_dir.rglob("*.sqlite"):
     if is_finished(path):
         count += 1
 if count == 0:
