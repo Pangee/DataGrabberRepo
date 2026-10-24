@@ -24,6 +24,8 @@ Copy R2 access into `Contents/Resources/r2.json` of the new .app so another Mac 
 
 Read the marketing version from the repo file `VERSION`. Put it in `CFBundleShortVersionString`, `CFBundleVersion`, and `Contents/Resources/VERSION.txt`. Do not edit `VERSION` during a rebuild. The bundle display name stays `DataGrabber`; the .app stays `DataGrabber.app`.
 
+After Info.plist, VERSION.txt, and r2.json are in place, clear xattrs and ad-hoc **re-sign** the bundle (`codesign --force --deep --sign -`). PyInstaller signs first; those later writes invalidate that signature. A broken signature is what macOS reports as “DataGrabber is damaged and can’t be opened” when the app comes from a downloaded DMG. Verify with `codesign --verify --deep --strict` before wrapping the DMG.
+
 The DMG window is the usual drag-to-Applications installer: DataGrabber.app on the left, Applications on the right. Opening the app from Applications later throws the Desktop/Downloads `.dmg` in the Trash.
 
 ```bash
@@ -143,6 +145,11 @@ out.write_text(
 print("R2_CREDS_BUNDLED")
 PY
 xattr -cr "$APP_SRC"
+# Re-seal after Info.plist / VERSION.txt / r2.json. Leaving PyInstaller's
+# original signature in place makes Gatekeeper say the app is damaged.
+codesign --force --deep --sign - --identifier "com.datagrabber.DataGrabber" "$APP_SRC"
+codesign --verify --deep --strict --verbose=2 "$APP_SRC"
+echo "CODESIGN_OK"
 
 # Copy finished current-use county files into Application Support BEFORE the
 # old Desktop app is trashed. The new .app does not keep the databases inside
@@ -295,6 +302,13 @@ hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 -o "$DESKTOP_DMG"
 xattr -cr "$DESKTOP_DMG"
 trap - EXIT
 cleanup_dmg
+
+VERIFY_DIR="$(mktemp -d /tmp/datagrabber-verify.XXXXXX)"
+hdiutil attach -readonly -nobrowse -noverify -noautoopen -mountpoint "$VERIFY_DIR" "$DESKTOP_DMG"
+codesign --verify --deep --strict --verbose=2 "$VERIFY_DIR/DataGrabber.app"
+echo "DMG_APP_CODESIGN_OK"
+hdiutil detach "$VERIFY_DIR"
+rmdir "$VERIFY_DIR"
 
 python - << 'PY'
 import re
