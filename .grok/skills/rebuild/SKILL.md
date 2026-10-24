@@ -21,6 +21,8 @@ Build first. Only replace the Desktop app after PyInstaller exits successfully, 
 
 Before the old Desktop app is moved to the Trash, copy finished county files from its `Contents/Resources/taxlots_current` into `~/Library/Application Support/DataGrabber/taxlots_current`. Copy a `.sqlite` file only when its `meta` row `finished` is `1`, and check the copy is still finished before the Trash step. Do not copy the bytes' extended attributes. Do not copy `taxlots_update`, `.py` county files, partial files, or unfinished files. If Application Support already has a finished file with the same or a newer stamp, keep that file. Do not put the databases inside the new .app. If that check fails, stop. The current Desktop app stays where it is.
 
+Copy R2 access into `Contents/Resources/r2.json` of the new .app so another Mac can download county files without rclone. Prefer `~/Library/Application Support/DataGrabber/r2.json`, then `rclone.conf` `[r2]`. Do not print the keys. If no keys are found, stop so a Release is not shipped without cloud access.
+
 ```bash
 set -euo pipefail
 cd "/Users/danielrohr/Documents/Visual Studios Projects/DataGrabber"
@@ -57,6 +59,76 @@ with p.open("wb") as fh:
     plistlib.dump(info, fh)
 print("INFO_PLIST_OK")
 print("CFBundleVersion", info["CFBundleVersion"])
+PY
+python - << 'PY'
+# Ship R2 read keys inside the .app (like certifi) so another Mac can
+# download county files with a double-click. Keys stay out of git.
+import json
+import sys
+from pathlib import Path
+
+def from_r2_json(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    access = data.get("access_key_id") or data.get("accessKeyId")
+    secret = data.get("secret_access_key") or data.get("secretAccessKey")
+    if access and secret:
+        return str(access), str(secret)
+    return None
+
+def from_rclone(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    section = None
+    access = None
+    secret = None
+    found = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            if section == "r2" and access and secret:
+                found = (access, secret)
+            section = line[1:-1].strip()
+            access = None
+            secret = None
+            continue
+        if section != "r2" or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key == "access_key_id":
+            access = value
+        elif key == "secret_access_key":
+            secret = value
+    if section == "r2" and access and secret:
+        found = (access, secret)
+    return found
+
+home = Path.home()
+creds = from_r2_json(home / "Library/Application Support/DataGrabber/r2.json")
+if creds is None:
+    creds = from_rclone(home / ".config/rclone/rclone.conf")
+if creds is None:
+    creds = from_rclone(home / ".rclone.conf")
+if creds is None:
+    print("ERROR: R2_CREDS_MISSING", file=sys.stderr)
+    raise SystemExit(1)
+out = Path("dist/DataGrabber.app/Contents/Resources/r2.json")
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(
+    json.dumps({"access_key_id": creds[0], "secret_access_key": creds[1]}) + "\n",
+    encoding="utf-8",
+)
+print("R2_CREDS_BUNDLED")
 PY
 xattr -cr "$APP_SRC"
 

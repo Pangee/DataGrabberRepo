@@ -122,14 +122,16 @@ def _make_ssl_context():
 
 _SSL_CONTEXT = _make_ssl_context()
 
-# Public R2 prefix, e.g. https://pub-….r2.dev/taxlots_current
-# Leave empty to use signed S3 (rclone.conf or Application Support r2.json).
+# Public r2.dev prefix, e.g. https://pub-….r2.dev/taxlots_current
+# Leave empty to use signed GET. A rebuilt .app carries r2.json in Resources
+# so another Mac can download without rclone or extra installs.
 CLOUD_PACK_BASE_URL = ""
 CLOUD_PACK_S3_ENDPOINT = (
     "https://e4646317e20ffeac92a6e8edd4c9bd11.r2.cloudflarestorage.com"
 )
 CLOUD_PACK_S3_BUCKET = "datagrabberdata"
 CLOUD_PACK_S3_PREFIX = "taxlots_current"
+AUTO_UPDATE_DEFAULT = False
 
 
 def _urlopen(req, timeout=20):
@@ -1805,12 +1807,21 @@ def _credentials_from_rclone_conf(path):
 
 
 def _r2_credentials():
-    """Keys from Application Support r2.json, then rclone.conf [r2]. Never from source."""
-    for path in (
+    """Keys shipped in the .app, then Application Support, then rclone.conf.
+
+    Source never stores keys. Rebuild copies r2.json into Contents/Resources
+    so a GitHub Release .app can download on another Mac with a double-click.
+    """
+    paths = []
+    bundle = _bundle_resources_dir()
+    if bundle is not None:
+        paths.append(bundle / "r2.json")
+    paths.extend((
         _app_support_dir() / "r2.json",
         Path.home() / ".config" / "rclone" / "rclone.conf",
         Path.home() / ".rclone.conf",
-    ):
+    ))
+    for path in paths:
         if path.suffix == ".json":
             creds = _credentials_from_r2_json(path)
         else:
@@ -4799,11 +4810,11 @@ def _auto_update_pref_path():
 
 
 def _read_auto_update_pref():
-    """The checkbox is off until the user turns it on and that choice is saved."""
+    """Off until the user turns it on. Missing or invalid files stay off."""
     try:
         return _auto_update_pref_path().read_text(encoding="utf-8").strip() == "1"
     except OSError:
-        return False
+        return bool(AUTO_UPDATE_DEFAULT)
 
 
 def _write_auto_update_pref(enabled):
